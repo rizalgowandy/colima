@@ -1,9 +1,13 @@
 package environment
 
 import (
+	"context"
 	"fmt"
 	"log"
 )
+
+// IsNoneRuntime returns if runtime is none.
+func IsNoneRuntime(runtime string) bool { return runtime == "none" }
 
 // Container is container environment.
 type Container interface {
@@ -11,17 +15,19 @@ type Container interface {
 	Name() string
 	// Provision provisions/installs the container runtime.
 	// Should be idempotent.
-	Provision() error
+	Provision(ctx context.Context) error
 	// Start starts the container runtime.
-	Start() error
+	Start(ctx context.Context) error
 	// Stop stops the container runtime.
-	Stop() error
+	Stop(ctx context.Context) error
 	// Teardown tears down/uninstall the container runtime.
-	Teardown() error
+	Teardown(ctx context.Context) error
+	// Update the container runtime.
+	Update(ctx context.Context) (bool, error)
 	// Version returns the container runtime version.
-	Version() string
+	Version(ctx context.Context) string
 	// Running returns if the container runtime is currently running.
-	Running() bool
+	Running(ctx context.Context) bool
 
 	Dependencies
 }
@@ -32,28 +38,32 @@ func NewContainer(runtime string, host HostActions, guest GuestActions) (Contain
 		return nil, fmt.Errorf("unsupported container runtime '%s'", runtime)
 	}
 
-	return containerRuntimes[runtime](host, guest), nil
+	return containerRuntimes[runtime].Func(host, guest), nil
 }
 
 // NewContainerFunc is implemented by container runtime implementations to create a new instance.
 type NewContainerFunc func(host HostActions, guest GuestActions) Container
 
-var containerRuntimes = map[string]NewContainerFunc{}
+var containerRuntimes = map[string]containerRuntimeFunc{}
+
+type containerRuntimeFunc struct {
+	Func   NewContainerFunc
+	Hidden bool
+}
 
 // RegisterContainer registers a new container runtime.
-func RegisterContainer(name string, f NewContainerFunc) {
+// If hidden is true, the container is not displayed as an available runtime.
+func RegisterContainer(name string, f NewContainerFunc, hidden bool) {
 	if _, ok := containerRuntimes[name]; ok {
 		log.Fatalf("container runtime '%s' already registered", name)
 	}
-	containerRuntimes[name] = f
+	containerRuntimes[name] = containerRuntimeFunc{Func: f, Hidden: hidden}
 }
 
 // ContainerRuntimes return the names of available container runtimes.
 func ContainerRuntimes() (names []string) {
-	for name := range containerRuntimes {
-		// exclude kubernetes from the runtime list
-		// TODO find a cleaner way to not hardcode kubernetes
-		if name == "kubernetes" {
+	for name, cont := range containerRuntimes {
+		if cont.Hidden {
 			continue
 		}
 		names = append(names, name)

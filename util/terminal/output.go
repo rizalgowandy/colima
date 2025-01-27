@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/fatih/color"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var _ io.WriteCloser = (*verboseWriter)(nil)
@@ -20,6 +21,7 @@ type verboseWriter struct {
 
 	lineHeight int
 	termWidth  int
+	overflow   int
 
 	lastUpdate time.Time
 }
@@ -64,7 +66,7 @@ func (v *verboseWriter) refresh() error {
 }
 
 func (v *verboseWriter) addLine() {
-	defer v.buf.Truncate(0)
+	defer v.buf.Reset()
 
 	// if height <=0, do not scroll
 	if v.lineHeight <= 0 {
@@ -91,8 +93,11 @@ func (v *verboseWriter) Close() error {
 
 func (v verboseWriter) sanitizeLine(line string) string {
 	// remove logrus noises
-	if strings.HasPrefix(line, "time=") {
-		line = line[strings.Index(line, "msg="):]
+	if strings.HasPrefix(line, "time=") && strings.Contains(line, "msg=") {
+		line = line[strings.Index(line, "msg=")+4:]
+		if l, err := strconv.Unquote(line); err == nil {
+			line = l
+		}
 	}
 
 	return "> " + line
@@ -103,10 +108,14 @@ func (v *verboseWriter) printScreen() error {
 		return err
 	}
 
+	v.overflow = 0
 	for _, line := range v.lines {
 		line = v.sanitizeLine(line)
 		if len(line) > v.termWidth {
-			line = line[:v.termWidth]
+			v.overflow += len(line) / v.termWidth
+			if len(line)%v.termWidth == 0 {
+				v.overflow -= 1
+			}
 		}
 		line = color.HiBlackString(line)
 		fmt.Println(line)
@@ -114,8 +123,8 @@ func (v *verboseWriter) printScreen() error {
 	return nil
 }
 
-func (v verboseWriter) clearScreen() {
-	for range v.lines {
+func (v *verboseWriter) clearScreen() {
+	for i := 0; i < len(v.lines)+v.overflow; i++ {
 		ClearLine()
 	}
 }
@@ -127,9 +136,16 @@ func (v *verboseWriter) updateTerm() error {
 	}
 	v.lastUpdate = time.Now().UTC()
 
-	w, _, err := terminal.GetSize(int(os.Stdout.Fd()))
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
 		return fmt.Errorf("error getting terminal size: %w", err)
+	}
+	// A width of zero would result in a division by zero panic when computing overflow
+	// in printScreen. Therefore, set it to a safe - even though probably wrong - value.
+	// We use <= 0 here because negative values are guaranteed to lead to unexpected
+	// results, even if they don't cause panics.
+	if w <= 0 {
+		w = 80
 	}
 	v.termWidth = w
 

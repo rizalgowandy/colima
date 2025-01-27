@@ -6,147 +6,339 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 
+	"github.com/abiosoft/colima/daemon"
+	"github.com/abiosoft/colima/daemon/process/vmnet"
+
 	"github.com/abiosoft/colima/config"
-	"github.com/abiosoft/colima/embedded"
 	"github.com/abiosoft/colima/environment"
+	"github.com/abiosoft/colima/environment/container/containerd"
 	"github.com/abiosoft/colima/environment/container/docker"
-	"github.com/abiosoft/colima/environment/vm/lima/network"
+	"github.com/abiosoft/colima/environment/container/incus"
+	"github.com/abiosoft/colima/environment/vm/lima/limaconfig"
+	"github.com/abiosoft/colima/environment/vm/lima/limautil"
 	"github.com/abiosoft/colima/util"
 	"github.com/sirupsen/logrus"
 )
 
-func newConf(ctx context.Context, conf config.Config) (l Config, err error) {
-	l.Arch = environment.Arch(conf.VM.Arch).Value()
+func newConf(ctx context.Context, conf config.Config) (l limaconfig.Config, err error) {
+	l.Arch = environment.Arch(conf.Arch).Value()
 
-	l.Images = append(l.Images,
-		File{Arch: environment.AARCH64, Location: "https://github.com/abiosoft/alpine-lima/releases/download/colima-v0.3.4-1/alpine-lima-clm-3.14.3-aarch64.iso", Digest: "sha512:363baa91e4087dfd04ec5eebadcb29b9aef45c2663642f951105b3989e93143ce45f94ba9101c01c5db46c3fc6b601340b39baad29b1a48bb4f735790048daaa"},
-		File{Arch: environment.X8664, Location: "https://github.com/abiosoft/alpine-lima/releases/download/colima-v0.3.4-1/alpine-lima-clm-3.14.3-x86_64.iso", Digest: "sha512:cd7ad0ef76088ea3d9f428e70fcddcbbcc72999568aaee0de953052299a01df251454fa5db3a0fdcfa70896bd152bc5d92f9ad81d682f3ec44cfbd2149ae3856"},
-	)
+	// VM type is qemu except in few scenarios
+	l.VMType = limaconfig.QEMU
 
-	l.CPUs = conf.VM.CPU
-	l.Memory = fmt.Sprintf("%dGiB", conf.VM.Memory)
-	l.Disk = fmt.Sprintf("%dGiB", conf.VM.Disk)
+	sameArchitecture := environment.HostArch() == l.Arch
 
-	l.SSH = SSH{LocalPort: 0, LoadDotSSHPubKeys: false, ForwardAgent: conf.VM.ForwardAgent}
-	l.Containerd = Containerd{System: false, User: false}
-	l.Firmware.LegacyBIOS = false
+	// when vz is chosen and OS version supports it
+	if util.MacOS13OrNewer() && conf.VMType == limaconfig.VZ && sameArchitecture {
+		l.VMType = limaconfig.VZ
 
-	l.DNS = conf.VM.DNS
-	// always use host resolver to generate Lima's default resolv.conf file
-	// colima will override this in VM when custom DNS is set
-	l.HostResolver.Enabled = true
-	l.HostResolver.Hosts = map[string]string{
-		"host.docker.internal": "host.lima.internal",
-	}
-
-	l.Env = map[string]string{}
-	for k, v := range conf.VM.Env {
-		l.Env[k] = v
-	}
-
-	// add user to docker group
-	// "sudo", "usermod", "-aG", "docker", user
-	l.Provision = append(l.Provision, Provision{
-		Mode:   ProvisionModeUser,
-		Script: `sudo usermod -aG docker $USER`,
-	})
-
-	// networking on Lima is limited to macOS
-	networkEnabled, _ := ctx.Value(ctxKeyNetwork).(bool)
-	if runtime.GOOS == "darwin" && networkEnabled {
-		// only set network settings if vmnet startup is successful
-		if err := func() error {
-			ptpFile, err := network.PTPFile()
-			if err != nil {
-				return err
+		// Rosetta is only available on M1
+		if conf.VZRosetta && util.MacOS13OrNewerOnArm() {
+			if util.RosettaRunning() {
+				l.Rosetta.Enabled = true
+				l.Rosetta.BinFmt = true
+			} else {
+				logrus.Warnln("Unable to enable Rosetta: Rosetta2 is not installed")
+				logrus.Warnln("Run 'softwareupdate --install-rosetta' to install Rosetta2")
 			}
-			// ensure the ptp file exists
-			if _, err := os.Stat(ptpFile); err != nil {
-				return err
-			}
-			dhcpScript, err := embedded.ReadString("network/dhcp.sh")
-			if err != nil {
-				return err
-			}
+		}
 
-			l.Networks = append(l.Networks, Network{
-				VNL:        ptpFile,
-				SwitchPort: 65535, // this is fixed
-			})
-
-			// credit: https://github.com/abiosoft/colima/issues/140#issuecomment-1072599309
-			l.Provision = append(l.Provision, Provision{
-				Mode:   ProvisionModeSystem,
-				Script: dhcpScript,
-			})
-			return nil
-		}(); err != nil {
-			logrus.Warn(fmt.Errorf("error setting up network: %w", err))
+		if util.MacOSNestedVirtualizationSupported() {
+			l.NestedVirtualization = conf.NestedVirtualization
 		}
 	}
 
-	// port forwarding
+	if conf.CPUType != "" && conf.CPUType != "host" {
+		l.CPUType = map[environment.Arch]string{
+			l.Arch: conf.CPUType,
+		}
+	}
+
+	if conf.CPU > 0 {
+		l.CPUs = &conf.CPU
+	}
+	if conf.Memory > 0 {
+		l.Memory = fmt.Sprintf("%dMiB", uint32(conf.Memory*1024))
+	}
+	if conf.Disk > 0 {
+		l.Disk = fmt.Sprintf("%dGiB", conf.Disk)
+	}
+	l.SSH = limaconfig.SSH{LocalPort: conf.SSHPort, LoadDotSSHPubKeys: false, ForwardAgent: conf.ForwardAgent}
+	l.Containerd = limaconfig.Containerd{System: false, User: false}
+
+	l.DNS = conf.Network.DNSResolvers
+	l.HostResolver.Enabled = len(conf.Network.DNSResolvers) == 0
+	l.HostResolver.Hosts = conf.Network.DNSHosts
+	if l.HostResolver.Hosts == nil {
+		l.HostResolver.Hosts = make(map[string]string)
+	}
+
+	if _, ok := l.HostResolver.Hosts["host.docker.internal"]; !ok {
+		l.HostResolver.Hosts["host.docker.internal"] = "host.lima.internal"
+	}
+
+	l.Env = conf.Env
+	if l.Env == nil {
+		l.Env = make(map[string]string)
+	}
+
+	// extra required provision commands
+	{
+		// fix inotify
+		l.Provision = append(l.Provision, limaconfig.Provision{
+			Mode:   limaconfig.ProvisionModeSystem,
+			Script: "sysctl -w fs.inotify.max_user_watches=1048576",
+		})
+
+		// add user to docker group
+		// "sudo", "usermod", "-aG", "docker", user
+		if conf.Runtime == docker.Name {
+			l.Provision = append(l.Provision, limaconfig.Provision{
+				Mode:   limaconfig.ProvisionModeDependency,
+				Script: "groupadd -f docker && usermod -aG docker {{ .User }}",
+			})
+		}
+
+		// add user to incus-admin group
+		// "sudo", "usermod", "-aG", "incus-admin", user
+		if conf.Runtime == incus.Name {
+			l.Provision = append(l.Provision, limaconfig.Provision{
+				Mode:   limaconfig.ProvisionModeDependency,
+				Script: "groupadd -f incus-admin && usermod -aG incus-admin {{ .User }}",
+			})
+		}
+
+		// set hostname
+		hostname := config.CurrentProfile().ID
+		if conf.Hostname != "" {
+			hostname = conf.Hostname
+		}
+		l.Provision = append(l.Provision, limaconfig.Provision{
+			Mode:   limaconfig.ProvisionModeSystem,
+			Script: "hostnamectl set-hostname " + hostname,
+		})
+
+	}
+
+	// network setup
+	{
+		l.Networks = append(l.Networks, limaconfig.Network{
+			Lima: "user-v2",
+		})
+
+		reachableIPAddress := true
+		if conf.Network.Address {
+			// incus always uses vmnet
+			if l.VMType == limaconfig.VZ && conf.Runtime != incus.Name {
+				l.Networks = append(l.Networks, limaconfig.Network{
+					VZNAT:     true,
+					Interface: limautil.NetInterface,
+					Metric:    limautil.NetMetric,
+				})
+			} else {
+				reachableIPAddress, _ = ctx.Value(daemon.CtxKey(vmnet.Name)).(bool)
+
+				// network is currently limited to macOS.
+				if util.MacOS() && reachableIPAddress {
+					if err := func() error {
+						socketFile := vmnet.Info().Socket.File()
+						// ensure the socket file exists
+						if _, err := os.Stat(socketFile); err != nil {
+							return fmt.Errorf("vmnet socket file not found: %w", err)
+						}
+
+						l.Networks = append(l.Networks, limaconfig.Network{
+							Socket:    socketFile,
+							Interface: limautil.NetInterface,
+							Metric:    limautil.NetMetric,
+						})
+
+						return nil
+					}(); err != nil {
+						reachableIPAddress = false
+						logrus.Warn(fmt.Errorf("error setting up reachable IP address: %w", err))
+					}
+				}
+			}
+
+			// disable ports 80 and 443 when k8s is enabled and there is a reachable IP address
+			// to prevent ingress (traefik) from occupying relevant host ports.
+			if reachableIPAddress && conf.Kubernetes.Enabled && !ingressDisabled(conf.Kubernetes.K3sArgs) {
+				l.PortForwards = append(l.PortForwards,
+					limaconfig.PortForward{
+						GuestIP:           net.ParseIP("0.0.0.0"),
+						GuestPort:         80,
+						GuestIPMustBeZero: true,
+						Ignore:            true,
+						Proto:             limaconfig.TCP,
+					},
+					limaconfig.PortForward{
+						GuestIP:           net.ParseIP("0.0.0.0"),
+						GuestPort:         443,
+						GuestIPMustBeZero: true,
+						Ignore:            true,
+						Proto:             limaconfig.TCP,
+					},
+				)
+			}
+
+			// disable port forwarding for Incus when there is a reachable IP address for consistent behaviour
+			if reachableIPAddress && conf.Runtime == incus.Name {
+				l.PortForwards = append(l.PortForwards,
+					limaconfig.PortForward{
+						GuestIP:           net.ParseIP("0.0.0.0"),
+						GuestIPMustBeZero: true,
+						GuestPortRange:    [2]int{1, 65535},
+						HostPortRange:     [2]int{1, 65535},
+						Ignore:            true,
+						Proto:             limaconfig.TCP,
+					},
+					limaconfig.PortForward{
+						GuestIP:        net.ParseIP("127.0.0.1"),
+						GuestPortRange: [2]int{1, 65535},
+						HostPortRange:  [2]int{1, 65535},
+						Ignore:         true,
+						Proto:          limaconfig.TCP,
+					},
+				)
+			}
+		}
+	}
+
+	// ports and sockets
 	{
 		// docker socket
 		if conf.Runtime == docker.Name {
 			l.PortForwards = append(l.PortForwards,
-				PortForward{
+				limaconfig.PortForward{
 					GuestSocket: "/var/run/docker.sock",
 					HostSocket:  docker.HostSocketFile(),
-					Proto:       TCP,
+					Proto:       limaconfig.TCP,
+				})
+			if config.CurrentProfile().ShortName == "default" {
+				// for backward compatibility, will be removed in future releases
+				l.PortForwards = append(l.PortForwards,
+					limaconfig.PortForward{
+						GuestSocket: "/var/run/docker.sock",
+						HostSocket:  docker.LegacyDefaultHostSocketFile(),
+						Proto:       limaconfig.TCP,
+					})
+			}
+		}
+
+		// containerd socket
+		if conf.Runtime == containerd.Name {
+			l.PortForwards = append(l.PortForwards,
+				limaconfig.PortForward{
+					GuestSocket: "/var/run/containerd.sock",
+					HostSocket:  containerd.HostSocketFile(),
+					Proto:       limaconfig.TCP,
+				})
+		}
+
+		if conf.Runtime == incus.Name {
+			l.PortForwards = append(l.PortForwards,
+				limaconfig.PortForward{
+					GuestSocket: "/var/lib/incus/unix.socket",
+					HostSocket:  incus.HostSocketFile(),
+					Proto:       limaconfig.TCP,
 				})
 		}
 
 		// handle port forwarding to allow listening on 0.0.0.0
 		// bind 0.0.0.0
 		l.PortForwards = append(l.PortForwards,
-			PortForward{
+			limaconfig.PortForward{
 				GuestIPMustBeZero: true,
 				GuestIP:           net.ParseIP("0.0.0.0"),
 				GuestPortRange:    [2]int{1, 65535},
 				HostIP:            net.ParseIP("0.0.0.0"),
 				HostPortRange:     [2]int{1, 65535},
-				Proto:             TCP,
+				Proto:             limaconfig.TCP,
 			},
 		)
 		// bind 127.0.0.1
 		l.PortForwards = append(l.PortForwards,
-			PortForward{
+			limaconfig.PortForward{
 				GuestIP:        net.ParseIP("127.0.0.1"),
 				GuestPortRange: [2]int{1, 65535},
 				HostIP:         net.ParseIP("127.0.0.1"),
 				HostPortRange:  [2]int{1, 65535},
-				Proto:          TCP,
+				Proto:          limaconfig.TCP,
 			},
 		)
+
+		// bind all host addresses when network address is not enabled
+		if !conf.Network.Address && conf.Network.HostAddresses {
+			for _, ip := range util.HostIPAddresses() {
+				l.PortForwards = append(l.PortForwards,
+					limaconfig.PortForward{
+						GuestIP:        ip,
+						GuestPortRange: [2]int{1, 65535},
+						HostIP:         ip,
+						HostPortRange:  [2]int{1, 65535},
+						Proto:          limaconfig.TCP,
+					},
+				)
+			}
+		}
 	}
 
-	if len(conf.VM.Mounts) == 0 {
+	switch strings.ToLower(conf.MountType) {
+	case "ssh", "sshfs", "reversessh", "reverse-ssh", "reversesshfs", limaconfig.REVSSHFS:
+		l.MountType = limaconfig.REVSSHFS
+	default:
+		if l.VMType == limaconfig.VZ {
+			l.MountType = limaconfig.VIRTIOFS
+		} else { // qemu
+			l.MountType = limaconfig.NINEP
+		}
+	}
+
+	l.Provision = append(l.Provision, limaconfig.Provision{
+		Mode:   limaconfig.ProvisionModeSystem,
+		Script: "mount -a",
+	})
+
+	// trim mounted drive to recover disk space
+	if conf.Runtime != incus.Name {
+		l.Provision = append(l.Provision, limaconfig.Provision{
+			Mode:   limaconfig.ProvisionModeSystem,
+			Script: `readlink /usr/sbin/fstrim || fstrim -a`,
+		})
+	}
+
+	if len(conf.Mounts) == 0 {
 		l.Mounts = append(l.Mounts,
-			Mount{Location: "~", Writable: true},
-			Mount{Location: filepath.Join("/tmp", config.Profile().ID), Writable: true},
+			limaconfig.Mount{Location: "~", Writable: true},
+			limaconfig.Mount{Location: filepath.Join("/tmp", config.CurrentProfile().ID), Writable: true},
 		)
 	} else {
 		// overlapping mounts are problematic in Lima https://github.com/lima-vm/lima/issues/302
-		if err = checkOverlappingMounts(conf.VM.Mounts); err != nil {
+		if err = checkOverlappingMounts(conf.Mounts); err != nil {
 			err = fmt.Errorf("overlapping mounts not supported: %w", err)
 			return
 		}
 
-		l.Mounts = append(l.Mounts, Mount{Location: config.CacheDir(), Writable: false})
+		l.Mounts = append(l.Mounts, limaconfig.Mount{Location: config.CacheDir(), Writable: false})
 		cacheOverlapFound := false
 
-		for _, v := range conf.VM.Mounts {
-			m := volumeMount(v)
-			var location string
-			location, err = m.Path()
+		for _, m := range conf.Mounts {
+			var location, mountPoint string
+			location, err = util.CleanPath(m.Location)
 			if err != nil {
 				return
 			}
-			l.Mounts = append(l.Mounts, Mount{Location: location, Writable: m.Writable()})
+			mountPoint, err = util.CleanPath(m.MountPoint)
+			if err != nil {
+				return
+			}
+
+			mount := limaconfig.Mount{Location: location, MountPoint: mountPoint, Writable: m.Writable}
+
+			l.Mounts = append(l.Mounts, mount)
 
 			// check if cache directory has been mounted by other mounts, and remove cache directory from mounts
 			if strings.HasPrefix(config.CacheDir(), location) && !cacheOverlapFound {
@@ -156,135 +348,28 @@ func newConf(ctx context.Context, conf config.Config) (l Config, err error) {
 		}
 	}
 
+	// provision scripts
+	for _, script := range conf.Provision {
+		l.Provision = append(l.Provision, limaconfig.Provision{
+			Mode:   script.Mode,
+			Script: script.Script,
+		})
+	}
+
 	return
 }
 
-// Config is lima config. Code copied from lima and modified.
-type Config struct {
-	Arch         environment.Arch  `yaml:"arch,omitempty"`
-	Images       []File            `yaml:"images"`
-	CPUs         int               `yaml:"cpus,omitempty"`
-	Memory       string            `yaml:"memory,omitempty"`
-	Disk         string            `yaml:"disk,omitempty"`
-	Mounts       []Mount           `yaml:"mounts,omitempty"`
-	SSH          SSH               `yaml:"ssh"`
-	Containerd   Containerd        `yaml:"containerd"`
-	Env          map[string]string `yaml:"env,omitempty"`
-	DNS          []net.IP          `yaml:"-"` // will be handled manually by colima
-	Firmware     Firmware          `yaml:"firmware"`
-	HostResolver HostResolver      `yaml:"hostResolver"`
-	PortForwards []PortForward     `yaml:"portForwards,omitempty"`
-	Networks     []Network         `yaml:"networks,omitempty"`
-	Provision    []Provision       `yaml:"provision,omitempty" json:"provision,omitempty"`
-}
+type Arch = environment.Arch
 
-type File struct {
-	Location string           `yaml:"location"` // REQUIRED
-	Arch     environment.Arch `yaml:"arch,omitempty"`
-	Digest   string           `yaml:"digest,omitempty"`
-}
-
-type Mount struct {
-	Location string `yaml:"location"` // REQUIRED
-	Writable bool   `yaml:"writable"`
-}
-
-type SSH struct {
-	LocalPort int `yaml:"localPort"`
-	// LoadDotSSHPubKeys loads ~/.ssh/*.pub in addition to $LIMA_HOME/_config/user.pub .
-	// Default: true
-	LoadDotSSHPubKeys bool `yaml:"loadDotSSHPubKeys"`
-	ForwardAgent      bool `yaml:"forwardAgent"` // default: false
-}
-
-type Containerd struct {
-	System bool `yaml:"system"` // default: false
-	User   bool `yaml:"user"`   // default: true
-}
-
-type Firmware struct {
-	// LegacyBIOS disables UEFI if set.
-	// LegacyBIOS is ignored for aarch64.
-	LegacyBIOS bool `yaml:"legacyBIOS"`
-}
-
-type Proto = string
-
-const (
-	TCP Proto = "tcp"
-)
-
-type PortForward struct {
-	GuestIPMustBeZero bool   `yaml:"guestIPMustBeZero,omitempty" json:"guestIPMustBeZero,omitempty"`
-	GuestIP           net.IP `yaml:"guestIP,omitempty" json:"guestIP,omitempty"`
-	GuestPort         int    `yaml:"guestPort,omitempty" json:"guestPort,omitempty"`
-	GuestPortRange    [2]int `yaml:"guestPortRange,omitempty" json:"guestPortRange,omitempty"`
-	GuestSocket       string `yaml:"guestSocket,omitempty" json:"guestSocket,omitempty"`
-	HostIP            net.IP `yaml:"hostIP,omitempty" json:"hostIP,omitempty"`
-	HostPort          int    `yaml:"hostPort,omitempty" json:"hostPort,omitempty"`
-	HostPortRange     [2]int `yaml:"hostPortRange,omitempty" json:"hostPortRange,omitempty"`
-	HostSocket        string `yaml:"hostSocket,omitempty" json:"hostSocket,omitempty"`
-	Proto             Proto  `yaml:"proto,omitempty" json:"proto,omitempty"`
-	Ignore            bool   `yaml:"ignore,omitempty" json:"ignore,omitempty"`
-}
-
-type HostResolver struct {
-	Enabled bool              `yaml:"enabled" json:"enabled"`
-	IPv6    bool              `yaml:"ipv6,omitempty" json:"ipv6,omitempty"`
-	Hosts   map[string]string `yaml:"hosts,omitempty" json:"hosts,omitempty"`
-}
-
-type Network struct {
-	// VNL is a Virtual Network Locator (https://github.com/rd235/vdeplug4/commit/089984200f447abb0e825eb45548b781ba1ebccd).
-	// On macOS, only VDE2-compatible form (optionally with vde:// prefix) is supported.
-	VNL        string `yaml:"vnl,omitempty" json:"vnl,omitempty"`
-	SwitchPort uint16 `yaml:"switchPort,omitempty" json:"switchPort,omitempty"` // VDE Switch port, not TCP/UDP port (only used by VDE networking)
-}
-
-type ProvisionMode = string
-
-const (
-	ProvisionModeSystem ProvisionMode = "system"
-	ProvisionModeUser   ProvisionMode = "user"
-)
-
-type Provision struct {
-	Mode   ProvisionMode `yaml:"mode" json:"mode"` // default: "system"
-	Script string        `yaml:"script" json:"script"`
-}
-
-type volumeMount string
-
-func (v volumeMount) Writable() bool {
-	str := strings.SplitN(string(v), ":", 2)
-	return len(str) >= 2 && str[1] == "w"
-}
-
-func (v volumeMount) Path() (string, error) {
-	split := strings.SplitN(string(v), ":", 2)
-	str := os.ExpandEnv(split[0])
-
-	if strings.HasPrefix(str, "~") {
-		str = strings.Replace(str, "~", util.HomeDir(), 1)
-	}
-
-	str = filepath.Clean(str)
-	if !filepath.IsAbs(str) {
-		return "", fmt.Errorf("relative paths not supported for mount '%s'", string(v))
-	}
-
-	return strings.TrimSuffix(str, "/") + "/", nil
-}
-
-func checkOverlappingMounts(mounts []string) error {
+func checkOverlappingMounts(mounts []config.Mount) error {
 	for i := 0; i < len(mounts)-1; i++ {
 		for j := i + 1; j < len(mounts); j++ {
-			a, err := volumeMount(mounts[i]).Path()
+			a, err := util.CleanPath(mounts[i].Location)
 			if err != nil {
 				return err
 			}
 
-			b, err := volumeMount(mounts[j]).Path()
+			b, err := util.CleanPath(mounts[j].Location)
 			if err != nil {
 				return err
 			}
@@ -295,4 +380,28 @@ func checkOverlappingMounts(mounts []string) error {
 		}
 	}
 	return nil
+}
+
+// disableHas checks if the provided feature is indeed found in the disable configuration slice.
+func ingressDisabled(disableFlags []string) bool {
+	disabled := func(s string) bool { return s == "traefik" || s == "ingress" }
+	for i, f := range disableFlags {
+		if f == "--disable" {
+			if len(disableFlags)-1 <= i {
+				return false
+			}
+			if disabled(disableFlags[i+1]) {
+				return true
+			}
+			continue
+		}
+		str := strings.SplitN(f, "=", 2)
+		if len(str) < 2 || str[0] != "--disable" {
+			continue
+		}
+		if disabled(str[1]) {
+			return true
+		}
+	}
+	return false
 }

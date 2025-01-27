@@ -1,6 +1,7 @@
 package lima
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 
@@ -9,10 +10,10 @@ import (
 )
 
 func (l limaVM) copyCerts() error {
-	log := l.Logger()
+	log := l.Logger(context.Background())
 	err := func() error {
 		dockerCertsDirHost := filepath.Join(util.HomeDir(), ".docker", "certs.d")
-		dockerCertsDirGuest := "/etc/docker/certs.d"
+		dockerCertsDirsGuest := []string{"/etc/docker/certs.d", "/etc/ssl/certs"}
 		if _, err := l.host.Stat(dockerCertsDirHost); err != nil {
 			// no certs found
 			return nil
@@ -22,6 +23,9 @@ func (l limaVM) copyCerts() error {
 
 		// copy to cache dir
 		dockerCertsCacheDir := filepath.Join(config.CacheDir(), "docker-certs")
+		if err := l.host.RunQuiet("rm", "-rf", dockerCertsCacheDir); err != nil {
+			return err
+		}
 		if err := l.host.RunQuiet("mkdir", "-p", dockerCertsCacheDir); err != nil {
 			return err
 		}
@@ -30,10 +34,17 @@ func (l limaVM) copyCerts() error {
 		}
 
 		// copy from cache to vm
-		if err := l.RunQuiet("sudo", "mkdir", "-p", dockerCertsDirGuest); err != nil {
-			return err
+		for _, dir := range dockerCertsDirsGuest {
+			// copy from cache to vm
+			if err := l.RunQuiet("sudo", "mkdir", "-p", dir); err != nil {
+				return err
+			}
+			if err := l.RunQuiet("sudo", "cp", "-R", dockerCertsCacheDir+"/.", dir); err != nil {
+				return err
+			}
 		}
-		return l.RunQuiet("sudo", "cp", "-R", dockerCertsCacheDir+"/.", dockerCertsDirGuest)
+
+		return nil
 	}()
 
 	// not a fatal error, a warning suffices.

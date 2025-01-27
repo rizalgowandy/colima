@@ -3,25 +3,29 @@ name: Go
 on:
   push:
     tags: ["v*"]
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.nix"
+      - "**/*.lock"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.nix"
+      - "**/*.lock"
+
+permissions: write-all
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
-          go-version: 1.17
-
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v2
-        with:
-            version: v1.43.0
-            args: --timeout 3m0s
+          go-version: "1.23"
 
       - name: Build
         run: go build -v ./...
@@ -29,28 +33,88 @@ jobs:
       - name: Test
         run: go test -v ./...
 
-  release:
-    needs: "build"
+  build-macos:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test
+        run: go test -v ./...
+
+  binaries-linux:
+    needs: "build-linux"
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
-          go-version: 1.17
+          go-version: "1.23"
 
-      - name: generate macOS binaries
+      - name: install gcc-aarch64-linux-gnu
         run: |
-          make OS=Darwin ARCH=x86_64
-          make OS=Darwin ARCH=arm64
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: generate Linux binaries
+      - name: generate binaries
         run: |
-          make OS=Linux ARCH=x86_64
-          make OS=Linux ARCH=aarch64
+          OS=Linux ARCH=x86_64 make
+          OS=Linux ARCH=aarch64 make
 
+      - name: upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: artifacts-linux
+          path: _output/binaries/
+
+  binaries-macos:
+    needs: "build-macos"
+    runs-on: macos-13
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: generate binaries
+        run: |
+          CGO_ENABLED=1 OS=Darwin ARCH=x86_64 make
+          CGO_ENABLED=1 OS=Darwin ARCH=arm64 make
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: artifacts-macos
+          path: _output/binaries/
+
+
+  release:
+    needs: ["binaries-linux", "binaries-macos"]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v3
+        with:
+          name: artifacts-linux
+          path: _output/binaries/
+      - uses: actions/download-artifact@v3
+        with:
+          name: artifacts-macos
+          path: _output/binaries/
       - name: create release
         if: github.event_name != 'pull_request'
         env:
@@ -58,13 +122,12 @@ jobs:
         run: >
           tag="${GITHUB_REF##*/}"
 
-          hub release create
-          -a _output/binaries/colima-Darwin-x86_64
-          -a _output/binaries/colima-Darwin-x86_64.sha256sum
-          -a _output/binaries/colima-Darwin-arm64
-          -a _output/binaries/colima-Darwin-arm64.sha256sum
-          -a _output/binaries/colima-Linux-x86_64
-          -a _output/binaries/colima-Linux-x86_64.sha256sum
-          -a _output/binaries/colima-Linux-aarch64
-          -a _output/binaries/colima-Linux-aarch64.sha256sum
-          -m "${tag}" --draft "${tag}"
+          gh release create "${tag}" --draft --title "${tag}"
+          _output/binaries/colima-Darwin-x86_64
+          _output/binaries/colima-Darwin-x86_64.sha256sum
+          _output/binaries/colima-Darwin-arm64
+          _output/binaries/colima-Darwin-arm64.sha256sum
+          _output/binaries/colima-Linux-x86_64
+          _output/binaries/colima-Linux-x86_64.sha256sum
+          _output/binaries/colima-Linux-aarch64
+          _output/binaries/colima-Linux-aarch64.sha256sum

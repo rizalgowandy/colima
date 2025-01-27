@@ -1,26 +1,27 @@
 package kubernetes
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/abiosoft/colima/cli"
 	"github.com/abiosoft/colima/config"
+	"github.com/abiosoft/colima/environment/vm/lima/limautil"
 )
 
-const kubeconfigKey = "kubeconfig"
+const masterAddressKey = "master_address"
 
-func (c kubernetesRuntime) provisionKubeconfig() error {
-	provisioned, _ := strconv.ParseBool(c.guest.Get(kubeconfigKey))
-	if provisioned {
+func (c kubernetesRuntime) provisionKubeconfig(ctx context.Context) error {
+	ip := limautil.IPAddress(config.CurrentProfile().ID)
+	if ip == c.guest.Get(masterAddressKey) {
 		return nil
 	}
 
-	log := c.Logger()
-	a := c.Init()
+	log := c.Logger(ctx)
+	a := c.Init(ctx)
 
 	a.Stage("updating config")
 
@@ -34,7 +35,7 @@ func (c kubernetesRuntime) provisionKubeconfig() error {
 		return fmt.Errorf("error retrieving home directory on host")
 	}
 
-	profile := config.Profile().ID
+	profile := config.CurrentProfile().ID
 	hostKubeDir := filepath.Join(hostHome, ".kube")
 	a.Add(func() error {
 		return c.host.Run("mkdir", "-p", filepath.Join(hostKubeDir, "."+profile))
@@ -45,15 +46,20 @@ func (c kubernetesRuntime) provisionKubeconfig() error {
 
 	// manipulate in VM and save to host
 	a.Add(func() error {
-		kubeconfig, err := c.guest.RunOutput("cat", "/etc/rancher/k3s/k3s.yaml")
+		kubeconfig, err := c.guest.Read("/etc/rancher/k3s/k3s.yaml")
 		if err != nil {
 			return fmt.Errorf("error fetching kubeconfig on guest: %w", err)
 		}
 		// replace name
 		kubeconfig = strings.ReplaceAll(kubeconfig, ": default", ": "+profile)
 
+		// replace IP
+		if ip != "" && ip != "127.0.0.1" {
+			kubeconfig = strings.ReplaceAll(kubeconfig, "https://127.0.0.1:", "https://"+ip+":")
+		}
+
 		// save on the host
-		return c.host.Write(tmpkubeconfFile, kubeconfig)
+		return c.host.Write(tmpkubeconfFile, []byte(kubeconfig))
 	})
 
 	// merge on host
@@ -69,7 +75,7 @@ func (c kubernetesRuntime) provisionKubeconfig() error {
 		}
 
 		// save
-		return host.Write(tmpkubeconfFile, kubeconfig)
+		return host.Write(tmpkubeconfFile, []byte(kubeconfig))
 	})
 
 	// backup current settings and save new config
@@ -90,25 +96,28 @@ func (c kubernetesRuntime) provisionKubeconfig() error {
 	})
 
 	// set new context
-	a.Add(func() error {
-		out, err := c.host.RunOutput("kubectl", "config", "use-context", profile)
-		if err != nil {
-			return err
-		}
-		log.Println(out)
-		return nil
-	})
+	conf, _ := ctx.Value(config.CtxKey()).(config.Config)
+	if conf.AutoActivate() {
+		a.Add(func() error {
+			out, err := c.host.RunOutput("kubectl", "config", "use-context", profile)
+			if err != nil {
+				return err
+			}
+			log.Println(out)
+			return nil
+		})
+	}
 
 	// save settings
 	a.Add(func() error {
-		return c.guest.Set(kubeconfigKey, "true")
+		return c.guest.Set(masterAddressKey, ip)
 	})
 
 	return a.Exec()
 }
 
 func (c kubernetesRuntime) unsetKubeconfig(a *cli.ActiveCommandChain) {
-	profile := config.Profile().ID
+	profile := config.CurrentProfile().ID
 	a.Add(func() error {
 		return c.host.Run("kubectl", "config", "unset", "users."+profile)
 	})
@@ -118,9 +127,19 @@ func (c kubernetesRuntime) unsetKubeconfig(a *cli.ActiveCommandChain) {
 	a.Add(func() error {
 		return c.host.Run("kubectl", "config", "unset", "clusters."+profile)
 	})
+	// kubectl config unset current-context
+	a.Add(func() error {
+		if c, _ := c.host.RunOutput("kubectl", "config", "current-context"); c != config.CurrentProfile().ID {
+			return nil
+		}
+		return c.host.Run("kubectl", "config", "unset", "current-context")
+	})
 }
 
 func (c kubernetesRuntime) teardownKubeconfig(a *cli.ActiveCommandChain) {
 	a.Stage("reverting config")
 	c.unsetKubeconfig(a)
+	a.Add(func() error {
+		return c.guest.Set(masterAddressKey, "")
+	})
 }

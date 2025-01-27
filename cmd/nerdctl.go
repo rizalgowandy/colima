@@ -13,6 +13,8 @@ import (
 	"github.com/abiosoft/colima/cmd/root"
 	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/environment/container/containerd"
+	"github.com/abiosoft/colima/util/fsutil"
+	"github.com/abiosoft/colima/util/osutil"
 	"github.com/spf13/cobra"
 )
 
@@ -96,8 +98,8 @@ var nerdctlLinkFunc = func() *cobra.Command {
 				ColimaApp string
 				Profile   string
 			}{
-				ColimaApp: os.Args[0],
-				Profile:   strings.TrimPrefix(config.Profile().ID, "colima-"),
+				ColimaApp: osutil.Executable(),
+				Profile:   config.CurrentProfile().ShortName,
 			}
 			var buf bytes.Buffer
 			if err := t.Execute(&buf, values); err != nil {
@@ -112,17 +114,28 @@ var nerdctlLinkFunc = func() *cobra.Command {
 						return fmt.Errorf("error backing up existing file: %w", err)
 					}
 				}
+				if err := fsutil.MkdirAll("/usr/local/bin", 0755); err != nil {
+					return nil
+				}
 				return os.WriteFile(nerdctlCmdArgs.path, buf.Bytes(), 0755)
 			}
 
 			// sudo is needed for the default path
-			log.Println("/usr/local/bin not writeable, sudo password required to install nerdctl binary")
+			log.Println("/usr/local/bin not writable, sudo password required to install nerdctl binary")
 			if exists && !nerdctlCmdArgs.isColimaScript {
 				c := cli.CommandInteractive("sudo", "mv", nerdctlCmdArgs.path, nerdctlCmdArgs.path+".moved")
 				if err := c.Run(); err != nil {
 					return fmt.Errorf("error backing up existing file: %w", err)
 				}
 			}
+			// prepare dir
+			{
+				c := cli.CommandInteractive("sudo", "mkdir", "-p", "/usr/local/bin")
+				if err := c.Run(); err != nil {
+					return err
+				}
+			}
+			// install script
 			{
 				c := cli.CommandInteractive("sudo", "sh", "-c", "cat > "+nerdctlCmdArgs.path)
 				c.Stdin = &buf

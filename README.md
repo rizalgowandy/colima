@@ -1,26 +1,30 @@
-# Colima
+![colima-logo](colima.png)
+
+## Colima - container runtimes on macOS (and Linux) with minimal setup.
 
 [![Go](https://github.com/abiosoft/colima/actions/workflows/go.yml/badge.svg)](https://github.com/abiosoft/colima/actions/workflows/go.yml)
 [![Integration](https://github.com/abiosoft/colima/actions/workflows/integration.yml/badge.svg)](https://github.com/abiosoft/colima/actions/workflows/integration.yml)
-
-Container runtimes on macOS (and Linux) with minimal setup.
+[![Go Report Card](https://goreportcard.com/badge/github.com/abiosoft/colima)](https://goreportcard.com/report/github.com/abiosoft/colima)
 
 ![Demonstration](colima.gif)
 
 ## Features
 
-- Intel and M1 Macs support
-- Simple CLI interface
-- Docker and Containerd support
-- Port Forwarding
+  Support for Intel and Apple Silicon Macs, and Linux
+- Simple CLI interface with sensible defaults
+- Automatic Port Forwarding
 - Volume mounts
-- Kubernetes
+- Multiple instances
+- Support for multiple container runtimes
+  - [Docker](https://docker.com) (with optional Kubernetes)
+  - [Containerd](https://containerd.io) (with optional Kubernetes)
+  - [Incus](https://linuxcontainers.org/incus) (containers and virtual machines)
 
 ## Getting Started
 
 ### Installation
 
-Colima is available on Homebrew, MacPorts, and Nix. Check [here](INSTALL.md) for other installation options.
+Colima is available on Homebrew, MacPorts, and Nix. Check [here](docs/INSTALL.md) for other installation options.
 
 ```
 # Homebrew
@@ -41,7 +45,7 @@ brew install --HEAD colima
 
 ### Upgrading
 
-If upgrading from v0.2.2 or lower, it is required to start afresh by deleting existing instance.
+If upgrading from v0.5.6 or lower, it is required to start afresh by deleting existing instance.
 
 ```sh
 colima delete # delete existing instance
@@ -61,6 +65,12 @@ For more usage options
 ```
 colima --help
 colima start --help
+```
+
+Or use a config file
+
+```
+colima start --edit
 ```
 
 ## Runtimes
@@ -84,10 +94,10 @@ It is recommended to run `colima nerdctl install` to install `nerdctl` alias scr
 
 kubectl is required for Kubernetes. Installable with `brew install kubectl`.
 
-To enable Kubernetes, start Colima with `--with-kubernetes` flag.
+To enable Kubernetes, start Colima with `--kubernetes` flag.
 
 ```
-colima start --with-kubernetes
+colima start --kubernetes
 ```
 
 #### Interacting with Image Registry
@@ -96,14 +106,35 @@ For Docker runtime, images built or pulled with Docker are accessible to Kuberne
 
 For Containerd runtime, images built or pulled in the `k8s.io` namespace are accessible to Kubernetes.
 
+### Incus
+
+<small>**Requires v0.7.0**</small>
+
+
+Incus client is required for Incus runtime. Installable with brew `brew install incus`.
+
+`colima start --runtime incus` starts and setup Incus.
+
+You can use the `incus` client on macOS after `colima start` with no additional setup.
+
+**Note:** Running virtual machines on Incus is only supported on m3 or newer Apple Silicon devices.
+
+### None
+
+<small>**Requires v0.7.0**</small>
+
+Colima can also be utilised solely as a headless virtual machine manager by specifying `none` runtime.
+
+
 ### Customizing the VM
 
-The default VM created by Colima has 2 CPUs, 2GiB memory and 60GiB storage.
+The default VM created by Colima has 2 CPUs, 2GiB memory and 100GiB storage.
 
-The VM can be customized by passing `--cpu`, `--memory` and `--disk` to `colima start`. If VM is already created, stop
-the VM and apply the flags when starting it.
+The VM can be customized either by passing additional flags to `colima start`.
+e.g. `--cpu`, `--memory`, `--disk`, `--runtime`.
+Or by editing the config file with `colima start --edit`.
 
-**NOTE** that only cpu and memory can be changed at anytime. Disk size cannot be changed after the VM is created.
+**NOTE**: ~~disk size cannot be changed after the VM is created.~~ From v0.5.3, disk size can be increased.
 
 #### Customization Examples
 
@@ -120,99 +151,52 @@ the VM and apply the flags when starting it.
   colima start --cpu 4 --memory 8
   ```
 
+- create VM with Rosetta 2 emulation. Requires v0.5.3 and MacOS >= 13 (Ventura) on Apple Silicon.
+
+  ```
+  colima start --vm-type=vz --vz-rosetta
+  ```
+
 ## Project Goal
 
 To provide container runtimes on macOS with minimal setup.
 
-## Project Status
-
-⚠️ The project is still in active early stage development and updates may introduce breaking changes.
-
 ## What is with the name?
 
-Colima means Containers in [Lima](https://github.com/lima-vm/lima).
+Colima means Containers on [Lima](https://github.com/lima-vm/lima).
 
-Since Lima is aka Linux on Mac. By transitivity, Colima can also mean Containers on Linux on Mac.
+Since Lima is aka Linux Machines. By transitivity, Colima can also mean Containers on Linux Machines.
 
-## FAQ
+## And the Logo?
 
-<details>
-<summary>How does Colima compare to Lima?</summary>
-<p>
+The logo was contributed by [Daniel Hodvogner](https://github.com/dhodvogner). Check [this issue](https://github.com/abiosoft/colima/issues/781) for more.
 
-Colima is basically a higher level usage of Lima and utilises Lima to provide Docker, Containerd and/or Kubernetes.
+## Troubleshooting and FAQs
 
-If you want more control over the underlying VM, you can either use Lima directly or override Colima's VM settings with [Lima overrides](https://github.com/lima-vm/lima/blob/873a39c6652fe5fcb07ee08418f39ccaeeea6979/pkg/limayaml/default.yaml#L271).
+Check [here](docs/FAQ.md) for Frequently Asked Questions.
 
-</p>
-</details>
-
-<details>
-<summary>Can it run alongside Docker for Mac?</summary>
-<p>
-
-~~No, except when started with Containerd runtime. Colima assumes to be the default Docker context and will conflict with
-Docker for Mac. You should run either, not both.~~
-
-Yes, from version v0.3.0 Colima leverages Docker contexts and can thereby run alongside Docker for Mac.
-
-`docker context list` can list all contexts and `docker context use` can be used to change the active context.
-
-</p>
-</details>
-
-<details>
-<summary>How to customize Docker config e.g. add insecure registries?</summary>
-<p>
-
-On first startup, Colima generates Docker daemon.json file at `$HOME/.colima/docker/daemon.json`.
-
-Simply modify the daemon.json file accordingly and restart Colima.
-
-</p>
-</details>
-
-<details>
-<summary>How does it compare to minikube, Kind, K3d?</summary>
-<p>
-
-### For Kubernetes
-
-Yes, you can create a Kubernetes cluster with minikube (with Docker driver), Kind or K3d instead of enabling Kubernetes
-in Colima. Those are better options if you need multiple clusters, or do not need Docker and Kubernetes to share the
-same images and runtime.
-
-### For Docker
-
-Minikube with Docker runtime can expose the cluster's Docker with `minikube docker-env`. But there are some caveats.
-
-- Kubernetes is not optional, even if you only need Docker.
-
-- All of minikube's free drivers for macOS fall-short in one of performance, port forwarding or volumes. While
-  port-forwarding and volumes are non-issue for Kubernetes, they can be a deal breaker for Docker-only use.
-
-</p>
-</details>
-
-<details>
-<summary>Are M1 macs supported?</summary>
-<p>
-
-Colima supports and works on M1 macs but not rigorously tested as the author do not currently possess an M1 device.
-Feedbacks would be appreciated.
-
-</p>
-</details>
+## Community
+- [GitHub Discussions](https://github.com/abiosoft/colima/discussions)
+- [GitHub Issues](https://github.com/abiosoft/colima/issues)
+- `#colima` channel in the CNCF Slack
+  - New account: <https://slack.cncf.io/>
+  - Login: <https://cloud-native.slack.com/>
 
 ## Help Wanted
 
-- Documentation
-- Testing on M1 Macs
-
-## Sponsoring the Project
-
-If you (or your company) are benefiting from the project and would like to support the contributors, kindly support the project on [Patreon](https://patreon.com/colima).
+- Documentation (wiki pages)
 
 ## License
 
 MIT
+
+
+## Sponsoring the Project
+
+If you (or your company) are benefiting from the project and would like to support the contributors, kindly support the project.
+
+<a href="https://www.buymeacoffee.com/abiosoft" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-blue.png" alt="Buy Me A Coffee" style="height: 40px !important;width: 160px !important;" ></a>
+
+[<img src="https://uploads-ssl.webflow.com/5ac3c046c82724970fc60918/5c019d917bba312af7553b49_MacStadium-developerlogo.png" style="max-height: 150px"/>](https://macstadium.com)
+
+

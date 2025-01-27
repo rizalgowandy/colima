@@ -6,7 +6,8 @@ import (
 	"text/tabwriter"
 
 	"github.com/abiosoft/colima/cmd/root"
-	"github.com/abiosoft/colima/environment/vm/lima"
+	"github.com/abiosoft/colima/config"
+	"github.com/abiosoft/colima/environment/vm/lima/limautil"
 	"github.com/docker/go-units"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -26,7 +27,12 @@ var listCmd = &cobra.Command{
 A new instance can be created during 'colima start' by specifying the '--profile' flag.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		instances, err := lima.Instances()
+		profile := []string{}
+		if cmd.Flag("profile").Changed {
+			profile = append(profile, config.CurrentProfile().ID)
+		}
+
+		instances, err := limautil.Instances(profile...)
 		if err != nil {
 			return err
 		}
@@ -35,6 +41,8 @@ A new instance can be created during 'colima start' by specifying the '--profile
 			encoder := json.NewEncoder(cmd.OutOrStdout())
 			// print instance per line to conform with Lima's output
 			for _, instance := range instances {
+				// dir should be hidden from the output
+				instance.Dir = ""
 				if err := encoder.Encode(instance); err != nil {
 					return err
 				}
@@ -43,20 +51,21 @@ A new instance can be created during 'colima start' by specifying the '--profile
 		}
 
 		w := tabwriter.NewWriter(cmd.OutOrStdout(), 4, 8, 4, ' ', 0)
-		fmt.Fprintln(w, "PROFILE\tSTATUS\tARCH\tCPUS\tMEMORY\tDISK\tADDRESS")
+		_, _ = fmt.Fprintln(w, "PROFILE\tSTATUS\tARCH\tCPUS\tMEMORY\tDISK\tRUNTIME\tADDRESS")
 
 		if len(instances) == 0 {
 			logrus.Warn("No instance found. Run `colima start` to create an instance.")
 		}
 
 		for _, inst := range instances {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
 				inst.Name,
 				inst.Status,
 				inst.Arch,
 				inst.CPU,
 				units.BytesSize(float64(inst.Memory)),
 				units.BytesSize(float64(inst.Disk)),
+				inst.Runtime,
 				inst.IPAddress,
 			)
 		}

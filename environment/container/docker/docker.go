@@ -1,10 +1,13 @@
 package docker
 
 import (
+	"context"
 	"time"
 
 	"github.com/abiosoft/colima/cli"
+	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/environment"
+	"github.com/abiosoft/colima/util/debutil"
 )
 
 // Name is container runtime name.
@@ -13,7 +16,7 @@ const Name = "docker"
 var _ environment.Container = (*dockerRuntime)(nil)
 
 func init() {
-	environment.RegisterContainer(Name, newRuntime)
+	environment.RegisterContainer(Name, newRuntime, false)
 }
 
 type dockerRuntime struct {
@@ -22,7 +25,7 @@ type dockerRuntime struct {
 	cli.CommandChain
 }
 
-// NewContainer creates a new docker runtime.
+// newRuntime creates a new docker runtime.
 func newRuntime(host environment.HostActions, guest environment.GuestActions) environment.Container {
 	return &dockerRuntime{
 		host:         host,
@@ -35,75 +38,87 @@ func (d dockerRuntime) Name() string {
 	return Name
 }
 
-func (d dockerRuntime) isUserPermissionFixed() bool {
-	err := d.guest.RunQuiet("sh", "-c", `getent group docker | grep "\b${USER}\b"`)
-	return err == nil
-}
+func (d dockerRuntime) Provision(ctx context.Context) error {
+	a := d.Init(ctx)
+	log := d.Logger(ctx)
 
-func (d dockerRuntime) Provision() error {
-	a := d.Init()
-	a.Stage("provisioning")
-
-	// check user permission
-	if !d.isUserPermissionFixed() {
-		a.Add(d.fixUserPermission)
-
-		a.Stage("restarting VM to complete setup")
-		a.Add(d.guest.Restart)
-	}
-
-	if !d.isDaemonFileCreated() {
-		a.Add(d.createDaemonFile)
-	}
+	conf, _ := ctx.Value(config.CtxKey()).(config.Config)
 
 	// daemon.json
-	a.Add(d.setupDaemonFile)
+	a.Add(func() error {
+		// these are not fatal errors
+		if err := d.createDaemonFile(conf.Docker, conf.Env); err != nil {
+			log.Warnln(err)
+		}
+		if err := d.addHostGateway(conf.Docker); err != nil {
+			log.Warnln(err)
+		}
+		if err := d.reloadAndRestartSystemdService(); err != nil {
+			log.Warnln(err)
+		}
+		return nil
+	})
 
 	// docker context
 	a.Add(d.setupContext)
-	a.Add(d.useContext)
+	if conf.AutoActivate() {
+		a.Add(d.useContext)
+	}
 
 	return a.Exec()
 }
 
-func (d dockerRuntime) Start() error {
-	a := d.Init()
+func (d dockerRuntime) Start(ctx context.Context) error {
+	a := d.Init(ctx)
 
-	a.Stage("starting")
-
-	a.Add(func() error {
-		return d.guest.Run("sudo", "service", "docker", "start")
+	// TODO: interval is high due to 0.6.3->0.6.4 docker-ce package transition
+	//       to ensure startup is successful
+	a.Retry("", time.Second, 120, func(int) error {
+		return d.guest.RunQuiet("sudo", "service", "docker", "start")
 	})
 
-	// service startup takes few seconds, retry at most 5 times before giving up.
-	a.Retry("waiting for startup to complete", time.Second*5, 10, func() error {
+	// service startup takes few seconds, retry for a minute before giving up.
+	a.Retry("", time.Second, 60, func(int) error {
 		return d.guest.RunQuiet("sudo", "docker", "info")
 	})
 
+	// ensure docker is accessible without root
+	// otherwise, restart to ensure user is added to docker group
+	a.Add(func() error {
+		if err := d.guest.RunQuiet("docker", "info"); err == nil {
+			return nil
+		}
+		ctx := context.WithValue(ctx, cli.CtxKeyQuiet, true)
+		return d.guest.Restart(ctx)
+	})
+
 	return a.Exec()
 }
 
-func (d dockerRuntime) Running() bool {
+func (d dockerRuntime) Running(ctx context.Context) bool {
 	return d.guest.RunQuiet("service", "docker", "status") == nil
 }
 
-func (d dockerRuntime) Stop() error {
-	a := d.Init()
-	a.Stage("stopping")
+func (d dockerRuntime) Stop(ctx context.Context) error {
+	a := d.Init(ctx)
 
 	a.Add(func() error {
-		if !d.Running() {
+		if !d.Running(ctx) {
 			return nil
 		}
 		return d.guest.Run("sudo", "service", "docker", "stop")
 	})
 
+	// clear docker context settings
+	// since the container runtime can be changed on startup,
+	// it is better to not leave unnecessary traces behind
+	a.Add(d.teardownContext)
+
 	return a.Exec()
 }
 
-func (d dockerRuntime) Teardown() error {
-	a := d.Init()
-	a.Stage("deleting")
+func (d dockerRuntime) Teardown(ctx context.Context) error {
+	a := d.Init(ctx)
 
 	// clear docker context settings
 	a.Add(d.teardownContext)
@@ -115,7 +130,17 @@ func (d dockerRuntime) Dependencies() []string {
 	return []string{"docker"}
 }
 
-func (d dockerRuntime) Version() string {
-	version, _ := d.host.RunOutput("docker", "version", "--format", `client: v{{.Client.Version}}{{printf "\n"}}server: v{{.Server.Version}}`)
+func (d dockerRuntime) Version(ctx context.Context) string {
+	version, _ := d.host.RunOutput("docker", "--context", config.CurrentProfile().ID, "version", "--format", `client: v{{.Client.Version}}{{printf "\n"}}server: v{{.Server.Version}}`)
 	return version
+}
+
+func (d *dockerRuntime) Update(ctx context.Context) (bool, error) {
+	packages := []string{
+		"docker-ce",
+		"docker-ce-cli",
+		"containerd.io",
+	}
+
+	return debutil.UpdateRuntime(ctx, d.guest, d, packages...)
 }

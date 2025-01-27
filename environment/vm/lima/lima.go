@@ -1,77 +1,55 @@
 package lima
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"time"
 
 	"github.com/abiosoft/colima/cli"
 	"github.com/abiosoft/colima/config"
+	"github.com/abiosoft/colima/config/configmanager"
+	"github.com/abiosoft/colima/core"
+	"github.com/abiosoft/colima/daemon"
 	"github.com/abiosoft/colima/environment"
-	"github.com/abiosoft/colima/environment/vm/lima/network"
+	"github.com/abiosoft/colima/environment/vm/lima/limaconfig"
+	"github.com/abiosoft/colima/environment/vm/lima/limautil"
 	"github.com/abiosoft/colima/util"
+	"github.com/abiosoft/colima/util/downloader"
+	"github.com/abiosoft/colima/util/osutil"
 	"github.com/abiosoft/colima/util/yamlutil"
 	"github.com/sirupsen/logrus"
+	yaml "gopkg.in/yaml.v3"
 )
 
 // New creates a new virtual machine.
 func New(host environment.HostActions) environment.VM {
-	env := limaInstanceEnvVar + "=" + config.Profile().ID
+	// lima config directory
+	limaHome := config.LimaDir()
 
-	home, err := limaHome()
-	if err != nil {
-		err = fmt.Errorf("error detecting Lima config directory: %w", err)
-		logrus.Warnln(err)
-		logrus.Warnln("falling back to default '$HOME/.lima'")
-		home = filepath.Join(util.HomeDir(), ".lima")
-	}
+	// environment variables for the subprocesses
+	var envs []string
+	envHome := limautil.EnvLimaHome + "=" + limaHome
+	envLimaInstance := envLimaInstance + "=" + config.CurrentProfile().ID
+	envSSHForward := "LIMA_SSH_PORT_FORWARDER=true"
+	envBinary := osutil.EnvColimaBinary + "=" + osutil.Executable()
+	envs = append(envs, envHome, envLimaInstance, envSSHForward, envBinary)
 
 	// consider making this truly flexible to support other VMs
 	return &limaVM{
-		host:         host.WithEnv(env),
-		home:         home,
+		host:         host.WithEnv(envs...),
+		limaHome:     limaHome,
 		CommandChain: cli.New("vm"),
-		network:      network.NewManager(host),
+		daemon:       daemon.NewManager(host),
 	}
 }
 
 const (
-	limaInstanceEnvVar = "LIMA_INSTANCE"
-	lima               = "lima"
-	limactl            = "limactl"
+	envLimaInstance = "LIMA_INSTANCE"
+	lima            = "lima"
+	limactl         = limautil.LimactlCommand
 )
-
-func limaHome() (string, error) {
-	var buf bytes.Buffer
-	cmd := cli.Command("limactl", "info")
-	cmd.Stdout = &buf
-
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("error retrieving lima info: %w", err)
-	}
-
-	var resp struct {
-		LimaHome string `json:"limaHome"`
-	}
-	if err := json.NewDecoder(&buf).Decode(&resp); err != nil {
-		return "", fmt.Errorf("error decoding json for lima info: %w", err)
-	}
-	if resp.LimaHome == "" {
-		return "", fmt.Errorf("error retrieving lima info, ensure lima version is >0.7.4")
-	}
-
-	return resp.LimaHome, nil
-}
-
-func (l limaVM) limaConfDir() string {
-	return filepath.Join(l.home, config.Profile().ID)
-}
 
 var _ environment.VM = (*limaVM)(nil)
 
@@ -82,11 +60,14 @@ type limaVM struct {
 	// keep config in case of restart
 	conf config.Config
 
+	// lima config
+	limaConf limaconfig.Config
+
 	// lima config directory
-	home string
+	limaHome string
 
 	// network between host and the vm
-	network network.NetworkManager
+	daemon daemon.Manager
 }
 
 func (l limaVM) Dependencies() []string {
@@ -95,83 +76,43 @@ func (l limaVM) Dependencies() []string {
 	}
 }
 
-var ctxKeyNetwork = struct{ name string }{name: "network"}
+func (l *limaVM) Start(ctx context.Context, conf config.Config) error {
+	a := l.Init(ctx)
 
-func (l limaVM) prepareNetwork(ctx cli.Context) error {
-	// limited to macOS for now
-	if runtime.GOOS != "darwin" {
-		return nil
+	if l.Created() {
+		return l.resume(ctx, conf)
 	}
 
-	// use a nested chain for convenience
-	a := l.Init()
-	log := l.Logger()
-
-	a.Stage("preparing network")
-	a.Add(func() error {
-		if !l.network.DependenciesInstalled() {
-			log.Println("network dependencies missing")
-			log.Println("sudo password may be required for setting up network dependencies")
-			return l.network.InstallDependencies()
-		}
-		return nil
-	})
-	a.Add(l.network.Start)
-
-	// delay to ensure that the network is running
-	a.Retry("", time.Second*1, 15, func() error {
-		ok, err := l.network.Running()
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("network process is not running")
-		}
+	a.Add(func() (err error) {
+		ctx, err = l.startDaemon(ctx, conf)
 		return err
 	})
 
-	// network failure is not fatal
-	if err := a.Exec(); err != nil {
-		log.Warnln(fmt.Errorf("error starting network: %w", err))
-	} else {
-		ctx.SetContext(context.WithValue(ctx, ctxKeyNetwork, true))
-	}
-
-	return nil
-}
-
-func (l *limaVM) Start(conf config.Config) error {
-	a := l.Init()
-
-	if l.Created() {
-		return l.resume(conf)
-	}
-
-	a.AddCtx(l.prepareNetwork)
-	// l.prepareNetwork()
-
 	a.Stage("creating and starting")
-	configFile := filepath.Join(os.TempDir(), config.Profile().ID+".yaml")
+	confFile := filepath.Join(os.TempDir(), config.CurrentProfile().ID+".yaml")
 
-	a.AddCtx(func(ctx cli.Context) error {
-		limaConf, err := newConf(ctx, conf)
-		if err != nil {
-			return err
-		}
-		return yamlutil.WriteYAML(limaConf, configFile)
+	a.Add(func() (err error) {
+		l.limaConf, err = newConf(ctx, conf)
+		return err
+	})
+
+	a.Add(l.assertQemu)
+
+	a.Add(func() error {
+		return l.downloadDiskImage(ctx, conf)
+	})
+
+	a.Add(func() error {
+		return yamlutil.WriteYAML(l.limaConf, confFile)
+	})
+
+	a.Add(l.writeNetworkFile)
+	a.Add(func() error {
+		return l.host.Run(limactl, "start", "--tty=false", confFile)
 	})
 	a.Add(func() error {
-		return l.host.Run(limactl, "start", "--tty=false", configFile)
+		return os.Remove(confFile)
 	})
-	a.Add(func() error {
-		return os.Remove(configFile)
-	})
-
-	// registry certs
-	a.Add(l.copyCerts)
-
-	// dns
-	l.applyDNS(a, conf)
 
 	// adding it to command chain to execute only after successful startup.
 	a.Add(func() error {
@@ -179,198 +120,130 @@ func (l *limaVM) Start(conf config.Config) error {
 		return nil
 	})
 
+	l.addPostStartActions(a, conf)
+
 	return a.Exec()
 }
 
-func (l limaVM) resume(conf config.Config) error {
-	log := l.Logger()
-	a := l.Init()
+func (l *limaVM) resume(ctx context.Context, conf config.Config) error {
+	log := l.Logger(ctx)
+	a := l.Init(ctx)
 
-	if l.Running() {
+	if l.Running(ctx) {
 		log.Println("already running")
 		return nil
 	}
 
-	a.AddCtx(l.prepareNetwork)
-
-	configFile := filepath.Join(l.limaConfDir(), "lima.yaml")
-
-	a.AddCtx(func(ctx cli.Context) error {
-		limaConf, err := newConf(ctx, conf)
-		if err != nil {
-			return err
-		}
-		return yamlutil.WriteYAML(limaConf, configFile)
+	a.Add(func() (err error) {
+		ctx, err = l.startDaemon(ctx, conf)
+		return err
 	})
+
+	a.Add(func() (err error) {
+		// disk must be resized before starting
+		conf = l.syncDiskSize(ctx, conf)
+
+		l.limaConf, err = newConf(ctx, conf)
+		return err
+	})
+
+	a.Add(l.assertQemu)
+
+	a.Add(l.setDiskImage)
+
+	a.Add(func() error {
+		err := yamlutil.WriteYAML(l.limaConf, config.CurrentProfile().LimaFile())
+		return err
+	})
+
+	a.Add(l.writeNetworkFile)
 
 	a.Stage("starting")
 	a.Add(func() error {
-		return l.host.Run(limactl, "start", config.Profile().ID)
+		return l.host.Run(limactl, "start", config.CurrentProfile().ID)
 	})
 
-	// registry certs
-	a.Add(l.copyCerts)
-
-	l.applyDNS(a, conf)
+	l.addPostStartActions(a, conf)
 
 	return a.Exec()
 }
 
-func (l limaVM) applyDNS(a *cli.ActiveCommandChain, conf config.Config) {
-	// manually set the DNS by modifying the resolve file.
-	//
-	// Lima's DNS settings is fixed at VM create and cannot be changed afterwards.
-	// this is a better approach as it only applies on VM startup and gets reset at shutdown.
-	// this is specific to Alpine , may be different for other distros.
-	log := l.Logger()
-	dnsFile := "/etc/resolv.conf"
-	dnsFileBak := dnsFile + ".lima"
-
-	a.Add(func() error {
-		// backup the original dns file (if not previously done)
-		if l.RunQuiet("stat", dnsFileBak) != nil {
-			err := l.RunQuiet("sudo", "cp", dnsFile, dnsFileBak)
-			if err != nil {
-				// custom DNS config failure should not prevent the VM from starting
-				// as the default config will be used.
-				// Rather, warn and terminate setting the DNS config.
-				log.Warnln(fmt.Errorf("error backing up default DNS config: %w", err))
-				return nil
-			}
-		}
-		return nil
-	})
-
-	a.Add(func() error {
-		// empty the file
-		if err := l.RunQuiet("sudo", "rm", "-f", dnsFile); err != nil {
-			return fmt.Errorf("error initiating DNS config: %w", err)
-		}
-
-		for _, dns := range conf.VM.DNS {
-			line := fmt.Sprintf(`echo nameserver %s >> %s`, dns.String(), dnsFile)
-			if err := l.RunQuiet("sudo", "sh", "-c", line); err != nil {
-				return fmt.Errorf("error applying DNS config: %w", err)
-			}
-		}
-
-		if len(conf.VM.DNS) > 0 {
-			return nil
-		}
-
-		// use the default Lima dns if no dns is set
-		return l.RunQuiet("sudo", "sh", "-c", fmt.Sprintf("cat %s >> %s", dnsFileBak, dnsFile))
-	})
+func (l limaVM) Running(_ context.Context) bool {
+	i, err := limautil.Instance()
+	if err != nil {
+		logrus.Trace(fmt.Errorf("error retrieving running instance: %w", err))
+		return false
+	}
+	return i.Running()
 }
 
-func (l limaVM) Running() bool {
-	return l.RunQuiet("uname") == nil
-}
-
-func (l limaVM) Stop(force bool) error {
-	log := l.Logger()
-	a := l.Init()
-	if !l.Running() {
+func (l limaVM) Stop(ctx context.Context, force bool) error {
+	log := l.Logger(ctx)
+	a := l.Init(ctx)
+	if !l.Running(ctx) && !force {
 		log.Println("not running")
 		return nil
 	}
 
 	a.Stage("stopping")
 
+	if util.MacOS() {
+		conf, _ := configmanager.LoadInstance()
+		a.Retry("", time.Second*1, 10, func(retryCount int) error {
+			err := l.daemon.Stop(ctx, conf)
+			if err != nil {
+				err = cli.ErrNonFatal(err)
+			}
+			return err
+		})
+	}
+
+	a.Add(func() error { l.removeHostAddresses(); return nil })
+
 	a.Add(func() error {
 		if force {
-			return l.host.Run(limactl, "stop", "--force", config.Profile().ID)
+			return l.host.Run(limactl, "stop", "--force", config.CurrentProfile().ID)
 		}
-		return l.host.Run(limactl, "stop", config.Profile().ID)
+		return l.host.Run(limactl, "stop", config.CurrentProfile().ID)
 	})
-
-	a.Add(l.network.Stop)
 
 	return a.Exec()
 }
 
-func (l limaVM) Teardown() error {
-	a := l.Init()
+func (l limaVM) Teardown(ctx context.Context) error {
+	a := l.Init(ctx)
 
-	a.Stage("deleting")
+	if util.MacOS() {
+		conf, _ := configmanager.LoadInstance()
+		a.Retry("", time.Second*1, 10, func(retryCount int) error {
+			return l.daemon.Stop(ctx, conf)
+		})
+	}
 
 	a.Add(func() error {
-		return l.host.Run(limactl, "delete", "--force", config.Profile().ID)
+		return l.host.Run(limactl, "delete", "--force", config.CurrentProfile().ID)
 	})
-
-	a.Add(l.network.Stop)
 
 	return a.Exec()
 }
 
-func (l limaVM) Restart() error {
+func (l limaVM) Restart(ctx context.Context) error {
 	if l.conf.Empty() {
 		return fmt.Errorf("cannot restart, VM not previously started")
 	}
 
-	if err := l.Stop(false); err != nil {
+	if err := l.Stop(ctx, false); err != nil {
 		return err
 	}
 
 	// minor delay to prevent possible race condition.
 	time.Sleep(time.Second * 2)
 
-	if err := l.Start(l.conf); err != nil {
+	if err := l.Start(ctx, l.conf); err != nil {
 		return err
 	}
 
 	return nil
-}
-
-func (l limaVM) Run(args ...string) error {
-	args = append([]string{lima}, args...)
-
-	a := l.Init()
-
-	a.Add(func() error {
-		return l.host.Run(args...)
-	})
-
-	return a.Exec()
-}
-
-func (l limaVM) RunInteractive(args ...string) error {
-	args = append([]string{lima}, args...)
-
-	a := l.Init()
-
-	a.Add(func() error {
-		return l.host.RunInteractive(args...)
-	})
-
-	return a.Exec()
-}
-
-func (l limaVM) RunOutput(args ...string) (out string, err error) {
-	args = append([]string{lima}, args...)
-
-	a := l.Init()
-
-	a.Add(func() (err error) {
-		out, err = l.host.RunOutput(args...)
-		return
-	})
-
-	err = a.Exec()
-	return
-}
-
-func (l limaVM) RunQuiet(args ...string) (err error) {
-	args = append([]string{lima}, args...)
-
-	a := l.Init()
-
-	a.Add(func() (err error) {
-		return l.host.RunQuiet(args...)
-	})
-
-	err = a.Exec()
-	return
 }
 
 func (l limaVM) Host() environment.HostActions {
@@ -378,56 +251,16 @@ func (l limaVM) Host() environment.HostActions {
 }
 
 func (l limaVM) Env(s string) (string, error) {
-	if !l.Running() {
+	ctx := context.Background()
+	if !l.Running(ctx) {
 		return "", fmt.Errorf("not running")
 	}
 	return l.RunOutput("echo", "$"+s)
 }
 
 func (l limaVM) Created() bool {
-	stat, err := os.Stat(l.limaConfDir())
-	return err == nil && stat.IsDir()
-}
-
-const configFile = "/etc/colima/colima.json"
-
-func (l limaVM) getConf() map[string]string {
-	obj := map[string]string{}
-	b, err := l.RunOutput("cat", configFile)
-	if err != nil {
-		return obj
-	}
-
-	// we do not care if it fails
-	_ = json.Unmarshal([]byte(b), &obj)
-
-	return obj
-}
-func (l limaVM) Get(key string) string {
-	if val, ok := l.getConf()[key]; ok {
-		return val
-	}
-
-	return ""
-}
-
-func (l limaVM) Set(key, value string) error {
-	obj := l.getConf()
-	obj[key] = value
-
-	b, err := json.Marshal(obj)
-	if err != nil {
-		return fmt.Errorf("error marshalling settings to json: %w", err)
-	}
-
-	if err := l.Run("sudo", "mkdir", "-p", filepath.Dir(configFile)); err != nil {
-		return fmt.Errorf("error saving settings: %w", err)
-	}
-	if err := l.Run("sudo", "sh", "-c", fmt.Sprintf(`echo %s > %s`, strconv.Quote(string(b)), configFile)); err != nil {
-		return fmt.Errorf("error saving settings: %w", err)
-	}
-
-	return nil
+	stat, err := os.Stat(config.CurrentProfile().LimaFile())
+	return err == nil && !stat.IsDir()
 }
 
 func (l limaVM) User() (string, error) {
@@ -437,4 +270,171 @@ func (l limaVM) User() (string, error) {
 func (l limaVM) Arch() environment.Arch {
 	a, _ := l.RunOutput("uname", "-m")
 	return environment.Arch(a)
+}
+
+func (l *limaVM) downloadDiskImage(ctx context.Context, conf config.Config) error {
+	log := l.Logger(ctx)
+
+	// use a user specified disk image
+	if conf.DiskImage != "" {
+		if _, err := os.Stat(conf.DiskImage); err != nil {
+			return fmt.Errorf("invalid disk image: %w", err)
+		}
+
+		image, err := limautil.Image(l.limaConf.Arch, conf.Runtime)
+		if err != nil {
+			return fmt.Errorf("error getting disk image details: %w", err)
+		}
+
+		sha := downloader.SHA{Size: 512, Digest: image.Digest}
+		if err := sha.ValidateFile(l.host, conf.DiskImage); err != nil {
+			return fmt.Errorf("disk image must be downloaded from '%s', hash failure: %w", image.Location, err)
+		}
+
+		image.Location = conf.DiskImage
+		l.limaConf.Images = []limaconfig.File{image}
+		return nil
+	}
+
+	// use a previously cached image
+	if image, ok := limautil.ImageCached(l.limaConf.Arch, conf.Runtime); ok {
+		l.limaConf.Images = []limaconfig.File{image}
+		return nil
+	}
+
+	// download image
+	log.Infoln("downloading disk image ...")
+	image, err := limautil.DownloadImage(l.limaConf.Arch, conf.Runtime)
+	if err != nil {
+		return fmt.Errorf("error getting qcow image: %w", err)
+	}
+
+	l.limaConf.Images = []limaconfig.File{image}
+	return nil
+}
+
+func (l *limaVM) setDiskImage() error {
+	var c limaconfig.Config
+	b, err := os.ReadFile(config.CurrentProfile().LimaFile())
+	if err != nil {
+		return err
+	}
+	if err := yaml.Unmarshal(b, &c); err != nil {
+		return err
+	}
+
+	l.limaConf.Images = c.Images
+	return nil
+}
+
+func (l *limaVM) syncDiskSize(ctx context.Context, conf config.Config) config.Config {
+	log := l.Logger(ctx)
+	instance, err := configmanager.LoadInstance()
+	if err != nil {
+		// instance config missing, ignore
+		return conf
+	}
+
+	resized := func() bool {
+		if instance.Disk == conf.Disk {
+			// nothing to do
+			return false
+		}
+
+		size := conf.Disk - instance.Disk
+		if size < 0 {
+			log.Warnln("disk size cannot be reduced, ignoring...")
+			return false
+		}
+
+		if err := util.AssertQemuImg(); err != nil {
+			log.Warnln(fmt.Errorf("unable to resize disk: %w", err))
+			return false
+		}
+
+		sizeStr := fmt.Sprintf("%dG", conf.Disk)
+		args := []string{"qemu-img", "resize"}
+		disk := limautil.ColimaDiffDisk(config.CurrentProfile().ID)
+		args = append(args, disk, sizeStr)
+
+		// qemu-img resize /path/to/diffdisk +10G
+		if err := l.host.RunQuiet(args...); err != nil {
+			log.Warnln(fmt.Errorf("unable to resize disk: %w", err))
+			return false
+		}
+
+		log.Printf("resizing disk to %dGiB...", conf.Disk)
+		return true
+	}()
+
+	if !resized {
+		conf.Disk = instance.Disk
+	}
+
+	return conf
+}
+
+func (l *limaVM) addPostStartActions(a *cli.ActiveCommandChain, conf config.Config) {
+	// registry certs
+	a.Add(l.copyCerts)
+
+	// cross-platform emulation
+	a.Add(func() error {
+		if !l.limaConf.Rosetta.Enabled {
+			// use binfmt when rosetta is disabled and emulation is disabled i.e. host arch
+			if arch := environment.HostArch(); arch == environment.Arch(conf.Arch).Value() {
+				if err := core.SetupBinfmt(l.host, l, environment.Arch(conf.Arch)); err != nil {
+					logrus.Warn(fmt.Errorf("unable to enable qemu %s emulation: %w", arch, err))
+				}
+			}
+
+			// rosetta is disabled
+			return nil
+		}
+
+		// enable rosetta
+		err := l.Run("sudo", "sh", "-c", `stat /proc/sys/fs/binfmt_misc/rosetta || echo ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/mnt/lima-rosetta/rosetta:OCF' > /proc/sys/fs/binfmt_misc/register`)
+		if err != nil {
+			logrus.Warn(fmt.Errorf("unable to enable rosetta: %w", err))
+			return nil
+		}
+
+		// disable qemu
+		if err := l.RunQuiet("stat", "/proc/sys/fs/binfmt_misc/qemu-x86_64"); err == nil {
+			err = l.Run("sudo", "sh", "-c", `echo 0 > /proc/sys/fs/binfmt_misc/qemu-x86_64`)
+			if err != nil {
+				logrus.Warn(fmt.Errorf("unable to disable qemu x86_84 emulation: %w", err))
+			}
+		}
+
+		return nil
+	})
+
+	// replicate addresses when network address is disabled
+	a.Add(func() error {
+		if err := l.replicateHostAddresses(conf); err != nil {
+			logrus.Warnln(fmt.Errorf("unable to assign host IP addresses to the VM: %w", err))
+		}
+		return nil
+	})
+
+	// preserve state
+	a.Add(func() error {
+		if err := configmanager.SaveToFile(conf, config.CurrentProfile().StateFile()); err != nil {
+			logrus.Warnln(fmt.Errorf("error persisting Colima state: %w", err))
+		}
+		return nil
+	})
+}
+
+func (l *limaVM) assertQemu() error {
+	// assert qemu requirement
+	sameArchitecture := environment.HostArch() == l.limaConf.Arch
+	if err := util.AssertQemuImg(); err != nil && l.limaConf.VMType == limaconfig.QEMU {
+		if !sameArchitecture {
+			return fmt.Errorf("qemu is required to emulate %s: %w", l.limaConf.Arch, err)
+		}
+		return err
+	}
+	return nil
 }

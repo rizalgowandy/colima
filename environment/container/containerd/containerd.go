@@ -1,18 +1,33 @@
 package containerd
 
 import (
+	"context"
+	_ "embed"
+	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/abiosoft/colima/cli"
+	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/environment"
 )
 
 // Name is container runtime name
 const Name = "containerd"
 
+var configDir = func() string { return config.CurrentProfile().ConfigDir() }
+
+// HostSocketFile returns the path to the containerd socket on host.
+func HostSocketFile() string { return filepath.Join(configDir(), "containerd.sock") }
+
 // This is written with assumption that Lima is the VM,
 // which provides nerdctl/containerd support out of the box.
 // There may be need to make this flexible for non-Lima VMs.
+
+//go:embed buildkitd.toml
+var buildKitConf []byte
+
+const buildKitConfFile = "/etc/buildkit/buildkitd.toml"
 
 func newRuntime(host environment.HostActions, guest environment.GuestActions) environment.Container {
 	return &containerdRuntime{
@@ -23,7 +38,7 @@ func newRuntime(host environment.HostActions, guest environment.GuestActions) en
 }
 
 func init() {
-	environment.RegisterContainer(Name, newRuntime)
+	environment.RegisterContainer(Name, newRuntime, false)
 }
 
 var _ environment.Container = (*containerdRuntime)(nil)
@@ -38,44 +53,42 @@ func (c containerdRuntime) Name() string {
 	return Name
 }
 
-func (c containerdRuntime) Provision() error {
-	// already provisioned as part of Lima
-	return nil
+func (c containerdRuntime) Provision(context.Context) error {
+	return c.guest.Write(buildKitConfFile, buildKitConf)
 }
 
-func (c containerdRuntime) Start() error {
-	a := c.Init()
+func (c containerdRuntime) Start(ctx context.Context) error {
+	a := c.Init(ctx)
 
-	a.Stage("starting")
 	a.Add(func() error {
-		return c.guest.Run("sudo", "service", "containerd", "start")
-	})
-	a.Add(func() error {
-		return c.guest.Run("sudo", "service", "buildkitd", "start")
+		return c.guest.Run("sudo", "service", "containerd", "restart")
 	})
 
 	// service startup takes few seconds, retry at most 10 times before giving up.
-	a.Retry("waiting for startup to complete", time.Second*5, 10, func() error {
+	a.Retry("", time.Second*5, 10, func(int) error {
 		return c.guest.RunQuiet("sudo", "nerdctl", "info")
+	})
+
+	a.Add(func() error {
+		return c.guest.Run("sudo", "service", "buildkit", "start")
 	})
 
 	return a.Exec()
 }
 
-func (c containerdRuntime) Running() bool {
+func (c containerdRuntime) Running(ctx context.Context) bool {
 	return c.guest.RunQuiet("service", "containerd", "status") == nil
 }
 
-func (c containerdRuntime) Stop() error {
-	a := c.Init()
-	a.Stage("stopping")
+func (c containerdRuntime) Stop(ctx context.Context) error {
+	a := c.Init(ctx)
 	a.Add(func() error {
 		return c.guest.Run("sudo", "service", "containerd", "stop")
 	})
 	return a.Exec()
 }
 
-func (c containerdRuntime) Teardown() error {
+func (c containerdRuntime) Teardown(context.Context) error {
 	// teardown not needed, will be part of VM teardown
 	return nil
 }
@@ -85,7 +98,11 @@ func (c containerdRuntime) Dependencies() []string {
 	return nil
 }
 
-func (c containerdRuntime) Version() string {
+func (c containerdRuntime) Version(ctx context.Context) string {
 	version, _ := c.guest.RunOutput("sudo", "nerdctl", "version", "--format", `client: {{.Client.Version}}{{printf "\n"}}server: {{(index .Server.Components 0).Version}}`)
 	return version
+}
+
+func (c *containerdRuntime) Update(ctx context.Context) (bool, error) {
+	return false, fmt.Errorf("update not supported for the %s runtime", Name)
 }

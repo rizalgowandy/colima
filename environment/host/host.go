@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/abiosoft/colima/util/terminal"
@@ -23,13 +25,26 @@ var _ environment.Host = (*hostEnv)(nil)
 
 type hostEnv struct {
 	env []string
+	dir string // working directory
+}
+
+func (h hostEnv) clone() hostEnv {
+	var newHost hostEnv
+	newHost.env = append(newHost.env, h.env...)
+	newHost.dir = h.dir
+	return newHost
 }
 
 func (h hostEnv) WithEnv(env ...string) environment.HostActions {
-	var newHost hostEnv
-	// use current and new env vars
-	newHost.env = append(newHost.env, h.env...)
+	newHost := h.clone()
+	// append new env vars
 	newHost.env = append(newHost.env, env...)
+	return newHost
+}
+
+func (h hostEnv) WithDir(dir string) environment.HostActions {
+	newHost := h.clone()
+	newHost.dir = dir
 	return newHost
 }
 
@@ -39,6 +54,9 @@ func (h hostEnv) Run(args ...string) error {
 	}
 	cmd := cli.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), h.env...)
+	if h.dir != "" {
+		cmd.Dir = h.dir
+	}
 
 	lineHeight := 6
 	if cli.Settings.Verbose {
@@ -62,10 +80,20 @@ func (h hostEnv) RunQuiet(args ...string) error {
 	}
 	cmd := cli.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), h.env...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	if h.dir != "" {
+		cmd.Dir = h.dir
+	}
 
-	return cmd.Run()
+	var errBuf bytes.Buffer
+	cmd.Stdout = nil
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	if err != nil {
+		return errCmd(cmd.Args, errBuf, err)
+	}
+
+	return nil
 }
 
 func (h hostEnv) RunOutput(args ...string) (string, error) {
@@ -75,15 +103,30 @@ func (h hostEnv) RunOutput(args ...string) (string, error) {
 
 	cmd := cli.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), h.env...)
-
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = nil
-
-	if err := cmd.Run(); err != nil {
-		return "", err
+	if h.dir != "" {
+		cmd.Dir = h.dir
 	}
+
+	var buf, errBuf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	if err != nil {
+		return "", errCmd(cmd.Args, errBuf, err)
+	}
+
 	return strings.TrimSpace(buf.String()), nil
+}
+
+func errCmd(args []string, stderr bytes.Buffer, err error) error {
+	// this is going to be part of a log output,
+	// reading the first line of the error should suffice
+	output, _ := stderr.ReadString('\n')
+	if len(output) > 0 {
+		output = output[:len(output)-1]
+	}
+	return fmt.Errorf("error running %v, output: %s, err: %s", args, strconv.Quote(output), strconv.Quote(err.Error()))
 }
 
 func (h hostEnv) RunInteractive(args ...string) error {
@@ -92,7 +135,33 @@ func (h hostEnv) RunInteractive(args ...string) error {
 	}
 	cmd := cli.CommandInteractive(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), h.env...)
+	if h.dir != "" {
+		cmd.Dir = h.dir
+	}
 	return cmd.Run()
+}
+
+func (h hostEnv) RunWith(stdin io.Reader, stdout io.Writer, args ...string) error {
+	if len(args) == 0 {
+		return errors.New("args not specified")
+	}
+	cmd := cli.CommandInteractive(args[0], args[1:]...)
+	cmd.Env = append(os.Environ(), h.env...)
+	if h.dir != "" {
+		cmd.Dir = h.dir
+	}
+
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+
+	var buf bytes.Buffer
+	cmd.Stderr = &buf
+
+	if err := cmd.Run(); err != nil {
+		return errCmd(cmd.Args, buf, err)
+	}
+
+	return nil
 }
 
 func (h hostEnv) Env(s string) string {
@@ -104,8 +173,8 @@ func (h hostEnv) Read(fileName string) (string, error) {
 	return string(b), err
 }
 
-func (h hostEnv) Write(fileName, body string) error {
-	return os.WriteFile(fileName, []byte(body), 0644)
+func (h hostEnv) Write(fileName string, body []byte) error {
+	return os.WriteFile(fileName, body, 0644)
 }
 
 func (h hostEnv) Stat(fileName string) (os.FileInfo, error) {

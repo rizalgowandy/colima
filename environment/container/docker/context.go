@@ -1,26 +1,29 @@
 package docker
 
 import (
-	"fmt"
 	"path/filepath"
 
 	"github.com/abiosoft/colima/config"
 )
 
-// HostSocketFile returns the path to the docker socket on host.
-func HostSocketFile() string { return filepath.Join(config.Dir(), "docker.sock") }
+var configDir = func() string { return config.CurrentProfile().ConfigDir() }
 
-func (d dockerRuntime) isContextCreated() bool {
-	command := fmt.Sprintf(`docker context ls -q | grep "^%s$"`, config.Profile().ID)
-	return d.host.RunQuiet("sh", "-c", command) == nil
+// HostSocketFile returns the path to the docker socket on host.
+func HostSocketFile() string { return filepath.Join(configDir(), "docker.sock") }
+func LegacyDefaultHostSocketFile() string {
+	return filepath.Join(filepath.Dir(configDir()), "docker.sock")
+}
+
+func (d dockerRuntime) contextCreated() bool {
+	return d.host.RunQuiet("docker", "context", "inspect", config.CurrentProfile().ID) == nil
 }
 
 func (d dockerRuntime) setupContext() error {
-	if d.isContextCreated() {
+	if d.contextCreated() {
 		return nil
 	}
 
-	profile := config.Profile()
+	profile := config.CurrentProfile()
 
 	return d.host.Run("docker", "context", "create", profile.ID,
 		"--description", profile.DisplayName,
@@ -29,13 +32,13 @@ func (d dockerRuntime) setupContext() error {
 }
 
 func (d dockerRuntime) useContext() error {
-	return d.host.Run("docker", "context", "use", config.Profile().ID)
+	return d.host.Run("docker", "context", "use", config.CurrentProfile().ID)
 }
 
 func (d dockerRuntime) teardownContext() error {
-	if !d.isContextCreated() {
+	if !d.contextCreated() {
 		return nil
 	}
 
-	return d.host.Run("docker", "context", "rm", "--force", config.Profile().ID)
+	return d.host.Run("docker", "context", "rm", "--force", config.CurrentProfile().ID)
 }
